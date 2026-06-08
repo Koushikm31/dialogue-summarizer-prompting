@@ -1,69 +1,68 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import requests
-import os
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 app = FastAPI(
     title="Dialogue Summarizer API",
-    description="Summarize customer-agent conversations using HuggingFace Inference API",
+    description="Summarize conversations using local optimized FLAN-T5-tiny",
     version="2.0"
 )
 
-# Get HF token from environment variable
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-small"
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+print("Loading model on startup...")
+tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-tiny")
+model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-tiny")
+device = torch.device("cpu")
+model = model.to(device)
+model.eval()
+print("✅ Model loaded successfully!")
 
 class SummarizeRequest(BaseModel):
     dialogue: str
     strategy: str = "few_shot"
 
-def call_hf_api(prompt: str) -> str:
-    """Call HuggingFace Inference API"""
-    payload = {"inputs": prompt}
-    response = requests.post(HF_API_URL, headers=HEADERS, json=payload)
-    
-    if response.status_code != 200:
-        return f"Error: {response.status_code}"
-    
-    result = response.json()
-    if isinstance(result, list) and len(result) > 0:
-        return result[0].get("generated_text", "No summary generated")
-    return "No summary generated"
-
 @app.post("/summarize")
 def summarize_dialogue(request: SummarizeRequest):
-    """Main endpoint - summarize dialogue"""
+    """Summarize using local optimized model"""
     try:
         if not request.dialogue or len(request.dialogue) < 10:
-            return {"error": "Dialogue too short (min 10 characters)", "status": 400}
+            return {"error": "Dialogue too short", "status": 400}
         
-        # Create prompt based on strategy
-        if request.strategy == "few_shot":
-            prompt = f"""Summarize this dialogue in 1-2 sentences.
-Example: Customer: I want to cancel. Agent: Why?
-Summary: Customer wants to cancel.
-
-Dialogue: {request.dialogue}
-Summary:"""
-        else:
-            prompt = f"""Summarize: {request.dialogue}"""
+        # Simple, fast prompt
+        prompt = f"Summarize this dialogue:\n{request.dialogue}\nSummary:"
         
-        summary = call_hf_api(prompt)
+        # Tokenize with memory optimization
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=256,
+            truncation=True
+        ).to(device)
+        
+        # Generate with optimizations
+        with torch.no_grad():
+            outputs = model.generate(
+                inputs["input_ids"],
+                max_length=60,
+                num_beams=1,  # Beam search disabled for speed
+                temperature=0.7
+            )
+        
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
         return {
-            "summary": summary,
+            "summary": summary.strip(),
             "strategy": request.strategy,
             "status": 200
         }
+    
     except Exception as e:
         return {"error": str(e), "status": 500}
 
 @app.get("/health")
 def health_check():
-    """Check if server is running"""
     return {
         "status": "healthy",
-        "model": "google/flan-t5-small (via HF API)",
+        "model": "google/flan-t5-tiny (237MB, optimized)",
         "version": "2.0"
     }
